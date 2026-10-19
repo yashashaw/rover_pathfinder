@@ -1,0 +1,14 @@
+# secrets
+.env
+.cdsapirc
+
+# downloaded / large data
+data/
+*.nc
+*.tif
+*.tar.gz
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
