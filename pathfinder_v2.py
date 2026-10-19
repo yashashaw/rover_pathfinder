@@ -5,7 +5,9 @@ Search: A* (compiled with numba) on a directed 16-neighbour graph
         (8 compass moves + 8 "knight" moves like 2 east / 1 south), then
         SMOOTHING: stretches of the grid route are replaced by straight lines
         whenever the straight line is allowed and costs no more on the real
-        terrain. The smoothed route is what gets reported, scored and plotted.
+        terrain, then RELAXATION nudges the waypoints (like beads on a string)
+        wherever that saves energy, so the route can follow smooth curves no
+        grid can. The final route is what gets reported, scored and plotted.
 
 Each step's cost is the battery energy to drive it:
     W     = rolling (Crr*m*g*L) + gravity (m*g*dh) + drag (F_drag*L)
@@ -26,6 +28,35 @@ and scores EVERY route with the full model. Extra energy = that feature's regret
   weather off -> calm air, one default outside temperature
   snow off    -> every cell gets the area's AVERAGE snow Crr
   rough off   -> every cell gets the area's AVERAGE roughness
+
+FIXED (bugs caught by test_pathfinder.py / _pt2.py, Oct 2026) - search "FIXED" below
+  1. Routes could cut through the corner of a forbidden square.
+     A straight line was only checked at points every 5 m. If it crossed a
+     forbidden square for a short stretch between two points (e.g. clipping
+     its corner from 6 m to 8 m), no point landed there and the line was
+     wrongly called safe. Now every square the line passes through is checked
+     (segment_clear), and diagonal grid moves can't squeeze between two
+     forbidden squares that touch at a corner (_knight_clear).
+     Caught by: maze, crevasse_field.
+  2. Routes couldn't follow smooth curves, so they weren't always cheapest.
+     Routes were built only from straight pieces in 16 directions. When the
+     best route is a gentle curve (e.g. bowing toward harder snow), a simple
+     hand-drawn curve used 1.2 Wh less than the planner's route. Now, after
+     smoothing, the route is nudged point by point ("beads on a string",
+     relax_path) wherever that saves energy, coarse moves first then fine.
+     It only ever keeps a change that lowers the energy.
+     Caught by: crr_depth.
+  3. Routes zig-zagged in a steady headwind instead of going straight.
+     Two causes: (a) drag only counted the head/tail part of the wind, so a
+     crosswind was free and angling slightly off the wind looked cheaper; and
+     (b) drag for in-between headings was blended in straight lines between
+     the 16 directions, which under-estimates it a few degrees off the wind.
+     Now drag uses the full airflow (head/tail + side), and in-between
+     headings use a smooth curve fitted through all 16 directions.
+     Caught by: uniform_headwind in test_pathfinder.py (2.61 km instead of 2.60).
+  Side effect of fix 2: some results moved because the planner now finds
+  better curves (e.g. at 0.25 m/s the route bows 0.11 km instead of staying
+  straight - the old "straight" was a grid limitation, not the best route).
 
 Pictures (outputs/):
   routes.png   - the routes on a grey terrain shading
@@ -103,9 +134,16 @@ PARAMS = dict(
     t_outside_c_default=-30.0,   # weather OFF
     p_air_pa_default=65000.0,    # weather OFF (roughly Dome C pressure)
 
+    # keep-out zones: (x, y, radius_m, name) in EPSG:3031. Whole area is no-go,
+    # not just the steep cells. Ignored if outside the map.
+    keepouts=[(1360008.0, -894378.0, 500.0, "Concordia station")],
+
     # smoothing
     smooth=True,
     smooth_lookahead=60,         # keep trying this many cells past a failed shortcut
+    relax=True,                  # then nudge waypoints into a smooth cheaper curve
+    relax_spacing=10,            # bead spacing for nudging (cells; 10 = every 100 m)
+    relax_rounds=30,             # passes per step size
 )
 
 G = 9.81
@@ -173,7 +211,12 @@ def _heap_pop(hk, hv, n):
 
 @njit(cache=True)
 def _knight_clear(blocked, r, c, dr, dc):
-    """A knight move passes between two cells; both must be passable."""
+    """Knight and diagonal moves pass between cells; those must be passable
+    (no cutting corners of off-limits cells)."""
+    # FIXED (1): diagonal moves used to slip between two forbidden squares
+    # that touch at a corner. Now both side squares must be passable.
+    if abs(dr) == 1 and abs(dc) == 1:
+        return not (blocked[r + dr, c] or blocked[r, c + dc])
     if abs(dc) == 2:
         h = dc // 2
         return not (blocked[r, c + h] or blocked[r + dr, c + h])
@@ -331,25 +374,91 @@ def _bilinear(a, y, x):
             + fy * ((1 - fx) * a[r1, c0] + fx * a[r1, c1]))
 
 
+# FIXED (3): drag for in-between headings used to be a straight-line blend of
+# the two nearest of the 16 directions. That blend UNDER-estimates drag a few
+# degrees off a strong headwind, so routes zig-zagged ("tacked") to exploit it
+# (test uniform_headwind). Drag is now a smooth curve fitted through all 16
+# directions (a short Fourier series), which follows the real shape closely.
+N_HARM = 4                                   # harmonics in the heading curve
+_A = np.ones((ND, 2 * N_HARM + 1))
+for _k in range(1, N_HARM + 1):
+    _A[:, 2 * _k - 1] = np.cos(_k * _ang)
+    _A[:, 2 * _k] = np.sin(_k * _ang)
+DRAG_FIT = np.linalg.pinv(_A)                # (coefficients x 16 directions)
+_COEF_CACHE = {}
+
+
+def drag_coef(drag):
+    """Per-cell coefficients of drag-vs-heading, from the 16 direction layers."""
+    key = id(drag)
+    hit = _COEF_CACHE.get(key)
+    if hit is not None and hit[0] is drag:
+        return hit[1]
+    coef = np.einsum("kd,dyx->kyx", DRAG_FIT.astype(np.float32), drag).astype(np.float32)
+    coef = np.ascontiguousarray(coef)
+    if len(_COEF_CACHE) > 8:
+        _COEF_CACHE.clear()
+    _COEF_CACHE[key] = (drag, coef)
+    return coef
+
+
 @njit(cache=True)
-def _drag_heading(drag, ang_sorted, ang_order, r, c, theta):
-    """Drag force for any travel heading: interpolate between the two nearest
-    of the 16 directions (theta = map angle, x east / y north)."""
-    n = ang_sorted.shape[0]
-    k = 0
-    while k < n and ang_sorted[k] <= theta:
-        k += 1
-    i1 = k % n
-    i0 = (k - 1) % n
-    a0 = ang_sorted[i0]
-    a1 = ang_sorted[i1]
-    if k == 0 or k == n:              # wrap-around across +-pi
-        if theta < a1:
-            theta += 2 * math.pi
-        a1 += 2 * math.pi
-    span = a1 - a0
-    t = (theta - a0) / span if span > 0 else 0.0
-    return (1 - t) * drag[ang_order[i0], r, c] + t * drag[ang_order[i1], r, c]
+def _drag_heading(coef, ang_sorted, ang_order, r, c, theta):
+    """Drag force (N) for ANY travel heading (theta = map angle, x east / y north),
+    from the fitted curve. (ang_sorted/ang_order kept for the call signature.)"""
+    val = coef[0, r, c]
+    nh = (coef.shape[0] - 1) // 2
+    for k in range(1, nh + 1):
+        val += coef[2 * k - 1, r, c] * math.cos(k * theta) + coef[2 * k, r, c] * math.sin(k * theta)
+    return val
+
+
+# FIXED (1): straight lines used to be checked only at points every 5 m, so a
+# line clipping the corner of a forbidden square between two points was called
+# safe. segment_clear walks through EVERY square the line touches instead.
+@njit(cache=True)
+def segment_clear(blocked, y0, x0, y1, x1):
+    """True if a straight line between two cell centres touches NO off-limits
+    cell - checks every cell the line passes through (and both cells at an
+    exact corner), not just samples."""
+    ny, nx = blocked.shape
+    ys, xs, ye, xe = y0 + 0.5, x0 + 0.5, y1 + 0.5, x1 + 0.5
+    r, c = int(math.floor(ys)), int(math.floor(xs))
+    r_end, c_end = int(math.floor(ye)), int(math.floor(xe))
+    dy, dx = ye - ys, xe - xs
+    sr = 1 if dy > 0 else -1
+    sc = 1 if dx > 0 else -1
+    if dy != 0:
+        tmy = ((r + (1 if dy > 0 else 0)) - ys) / dy
+        tdy = abs(1.0 / dy)
+    else:
+        tmy, tdy = np.inf, np.inf
+    if dx != 0:
+        tmx = ((c + (1 if dx > 0 else 0)) - xs) / dx
+        tdx = abs(1.0 / dx)
+    else:
+        tmx, tdx = np.inf, np.inf
+    for _ in range(4 * (ny + nx)):
+        if r < 0 or r >= ny or c < 0 or c >= nx or blocked[r, c]:
+            return False
+        if r == r_end and c == c_end:
+            return True
+        if abs(tmx - tmy) < 1e-12:                 # exactly through a corner
+            if 0 <= r + sr < ny and blocked[r + sr, c]:
+                return False
+            if 0 <= c + sc < nx and blocked[r, c + sc]:
+                return False
+            r += sr
+            c += sc
+            tmx += tdx
+            tmy += tdy
+        elif tmx < tmy:
+            c += sc
+            tmx += tdx
+        else:
+            r += sr
+            tmy += tdy
+    return True
 
 
 @njit(cache=True)
@@ -364,6 +473,9 @@ def line_cost(y0, x0, y1, x1, z, crr, drag, tcost, blocked, ang_sorted, ang_orde
     dx = x1 - x0
     dist = math.sqrt(dx * dx + dy * dy)
     if dist == 0.0:
+        return out
+    if not segment_clear(blocked, y0, x0, y1, x1):
+        out[0] = np.inf
         return out
     nseg = max(1, int(math.ceil(dist * 2.0)))
     ds = dist * res / nseg
@@ -426,7 +538,7 @@ def smooth_path(path, cum, nx, z, crr, drag, tcost, blocked, ang_sorted, ang_ord
             lc = line_cost(float(ri), float(ci), float(rj), float(cj), z, crr, drag,
                            tcost, blocked, ang_sorted, ang_order, res, m, eta_d,
                            eta_r, tan_max)[0]
-            if lc <= (cum[j] - cum[i]) * (1.0 + 1e-9) + 1e-9:
+            if lc <= (cum[j] - cum[i]) * (1.0 + 1e-5) + 1e-6:   # tiny float slack
                 best = j
                 fails = 0
             else:
@@ -438,6 +550,93 @@ def smooth_path(path, cum, nx, z, crr, drag, tcost, blocked, ang_sorted, ang_ord
     for k in range(len(anchors)):
         out[k] = path[anchors[k]]
     return out
+
+
+@njit(cache=True)
+def _seg(rr, cc, i, j, z, crr, drag, tcost, blocked, ang_sorted, ang_order,
+         res, m, eta_d, eta_r, tan_max):
+    return line_cost(float(rr[i]), float(cc[i]), float(rr[j]), float(cc[j]), z, crr, drag,
+                     tcost, blocked, ang_sorted, ang_order, res, m, eta_d, eta_r, tan_max)[0]
+
+
+# FIXED (2): routes made only of straight 16-direction pieces couldn't follow
+# smooth curves, and a hand-drawn curve beat them by 1.2 Wh (test crr_depth).
+# relax_path nudges waypoints until no nudge saves energy.
+@njit(cache=True)
+def relax_path(pts, nx, z, crr, drag, tcost, blocked, ang_sorted, ang_order,
+               res, m, eta_d, eta_r, tan_max, spacing, max_rounds):
+    """Turn the route into a flexible string of beads every `spacing` cells and
+    keep nudging each bead (8 directions, big steps then small) whenever that
+    lowers the energy of its two neighbouring segments. Finds smooth curves that
+    no 16-direction grid route can follow exactly. Never makes the route worse."""
+    ny = z.shape[0]
+    # densify
+    rl = [pts[0] // nx]
+    cl = [pts[0] % nx]
+    for k in range(len(pts) - 1):
+        r0, c0 = pts[k] // nx, pts[k] % nx
+        r1, c1 = pts[k + 1] // nx, pts[k + 1] % nx
+        n = max(1, int(math.ceil(math.sqrt((r1 - r0) ** 2 + (c1 - c0) ** 2) / spacing)))
+        for q in range(1, n + 1):
+            rl.append(int(round(r0 + (r1 - r0) * q / n)))
+            cl.append(int(round(c0 + (c1 - c0) * q / n)))
+    rr = np.array(rl, dtype=np.int64)
+    cc = np.array(cl, dtype=np.int64)
+    n = len(rr)
+    moves = np.array([[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [-1, 1], [1, -1], [1, 1]])
+    step = max(1, spacing // 2)
+    while step >= 1:
+        for _ in range(max_rounds):
+            improved = False
+            for i in range(1, n - 1):
+                base = (_seg(rr, cc, i - 1, i, z, crr, drag, tcost, blocked, ang_sorted,
+                             ang_order, res, m, eta_d, eta_r, tan_max)
+                        + _seg(rr, cc, i, i + 1, z, crr, drag, tcost, blocked, ang_sorted,
+                               ang_order, res, m, eta_d, eta_r, tan_max))
+                r0, c0 = rr[i], cc[i]
+                for k in range(8):
+                    r2 = r0 + moves[k, 0] * step
+                    c2 = c0 + moves[k, 1] * step
+                    if r2 < 0 or r2 >= ny or c2 < 0 or c2 >= nx or blocked[r2, c2]:
+                        continue
+                    rr[i], cc[i] = r2, c2
+                    cand = (_seg(rr, cc, i - 1, i, z, crr, drag, tcost, blocked, ang_sorted,
+                                 ang_order, res, m, eta_d, eta_r, tan_max)
+                            + _seg(rr, cc, i, i + 1, z, crr, drag, tcost, blocked, ang_sorted,
+                                   ang_order, res, m, eta_d, eta_r, tan_max))
+                    if cand < base * (1.0 - 1e-9):
+                        base = cand
+                        r0, c0 = r2, c2
+                        improved = True
+                    else:
+                        rr[i], cc[i] = r0, c0
+                rr[i], cc[i] = r0, c0
+            if not improved:
+                break
+        step //= 2
+    # drop beads that don't help (keeps the waypoint list short)
+    keep = np.ones(n, dtype=np.bool_)
+    i = 0
+    while i < n - 1:
+        j = i + 1
+        while j + 1 < n:
+            direct = _seg(rr, cc, i, j + 1, z, crr, drag, tcost, blocked, ang_sorted,
+                          ang_order, res, m, eta_d, eta_r, tan_max)
+            via = 0.0
+            for q in range(i, j + 1):
+                via += _seg(rr, cc, q, q + 1, z, crr, drag, tcost, blocked, ang_sorted,
+                            ang_order, res, m, eta_d, eta_r, tan_max)
+            if direct <= via * (1.0 + 1e-6):
+                keep[j] = False
+                j += 1
+            else:
+                break
+        i = j
+    out = []
+    for k in range(n):
+        if keep[k]:
+            out.append(rr[k] * nx + cc[k])
+    return np.array(out, dtype=np.int64)
 
 
 @njit(cache=True)
@@ -481,6 +680,47 @@ def make_blocked(z, res, p):
     if p["block_buffer_cells"] > 0:
         blocked = binary_dilation(blocked, iterations=p["block_buffer_cells"])
     return blocked, filled, slope
+
+
+def keepout_mask(info, shape, zones):
+    """Cells inside any keep-out circle."""
+    mask = np.zeros(shape, dtype=bool)
+    used = []
+    res = info["res"]
+    for (x, y, rad, name) in zones:
+        if not (info["left"] - rad <= x <= info["right"] + rad
+                and info["bottom"] - rad <= y <= info["top"] + rad):
+            continue
+        c0 = (x - info["left"]) / res - 0.5
+        r0 = (info["top"] - y) / res - 0.5
+        k = int(np.ceil(rad / res)) + 1
+        rr = np.arange(max(0, int(r0) - k), min(shape[0], int(r0) + k + 1))
+        cc = np.arange(max(0, int(c0) - k), min(shape[1], int(c0) + k + 1))
+        R, C = np.meshgrid(rr, cc, indexing="ij")
+        inside = (R - r0) ** 2 + (C - c0) ** 2 <= (rad / res) ** 2
+        mask[R[inside], C[inside]] = True
+        used.append((x, y, rad, name))
+    return mask, used
+
+
+def closest_approach(pts, blocked, nx, res):
+    """Smallest distance (m) from the route to any off-limits cell, and where."""
+    from scipy.ndimage import distance_transform_edt
+    if not blocked.any():
+        return None
+    dist = distance_transform_edt(~blocked) * res
+    best = (np.inf, 0.0, 0.0)
+    for k in range(len(pts) - 1):
+        r0, c0 = divmod(int(pts[k]), nx)
+        r1, c1 = divmod(int(pts[k + 1]), nx)
+        n = max(2, int(np.hypot(r1 - r0, c1 - c0) * 2) + 1)
+        rr = np.rint(np.linspace(r0, r1, n)).astype(int)
+        cc = np.rint(np.linspace(c0, c1, n)).astype(int)
+        d = dist[rr, cc]
+        i = int(np.argmin(d))
+        if d[i] < best[0]:
+            best = (float(d[i]), float(rr[i]), float(cc[i]))
+    return best
 
 
 def xy_to_index(x, y, info, shape):
@@ -671,8 +911,12 @@ def era5_fields(z, info, p, months, era5_dir):
     n_drive = np.maximum(driving.sum(axis=0), 1)
     for d in range(ND):
         along = wx * DIR_XY[d, 0] + wy * DIR_XY[d, 1]    # tailwind > 0
-        vrel = V - along
-        F = 0.5 * rho * p["cda_m2"] * vrel * np.abs(vrel)
+        cross = -wx * DIR_XY[d, 1] + wy * DIR_XY[d, 0]   # side wind
+        # FIXED (3): use the FULL airflow the rover feels (head/tail + side).
+        # Only the along-track part was used before, so a crosswind cost
+        # nothing and angling into the wind looked artificially cheap.
+        air = np.sqrt((V - along) ** 2 + cross ** 2)
+        F = 0.5 * rho * p["cda_m2"] * air * (V - along)  # force along travel
         drag_pts[d] = np.where(driving, F, 0.0).sum(axis=0) / n_drive
 
     t_c = t2m - 273.15
@@ -805,14 +1049,30 @@ def smooth(path, z, res, crr, drag, tcost, blocked, nx, p):
     if not p["smooth"]:
         return path
     cum = grid_prefix_cost(path, z, crr, drag, tcost, DIRS, DIR_LEN, nx, res, m, eta_d, eta_r)
-    return smooth_path(path, cum, nx, z, crr, drag, tcost, blocked, ANG_SORTED, ANG_ORDER,
-                       res, m, eta_d, eta_r, tan_max, p["smooth_lookahead"])
+    drag = drag_coef(drag)       # straight lines use the smooth heading curve
+    pts = smooth_path(path, cum, nx, z, crr, drag, tcost, blocked, ANG_SORTED, ANG_ORDER,
+                      res, m, eta_d, eta_r, tan_max, p["smooth_lookahead"])
+    if p.get("relax", True):     # FIXED (2): bend the route into cheaper curves
+        before = polyline_cost(pts, nx, z, crr, drag, tcost, blocked, ANG_SORTED, ANG_ORDER,
+                               res, m, eta_d, eta_r, tan_max)[0]
+        relaxed = pts
+        # coarse beads first (moves whole sections), then finer ones (local detail)
+        for sp in (8 * p["relax_spacing"], 4 * p["relax_spacing"], 2 * p["relax_spacing"],
+                   p["relax_spacing"]):
+            relaxed = relax_path(relaxed, nx, z, crr, drag, tcost, blocked, ANG_SORTED,
+                                 ANG_ORDER, res, m, eta_d, eta_r, tan_max, sp,
+                                 p["relax_rounds"])
+        after = polyline_cost(relaxed, nx, z, crr, drag, tcost, blocked, ANG_SORTED,
+                              ANG_ORDER, res, m, eta_d, eta_r, tan_max)[0]
+        if after < before:
+            pts = relaxed
+    return pts
 
 
 def score(pts, z, res, crr, drag, tcost, blocked, nx, p):
     """Energy breakdown (Wh) of a polyline through cell indices."""
     m, eta_d, eta_r, tan_max = _kw(p)
-    t = polyline_cost(pts, nx, z, crr, drag, tcost, blocked, ANG_SORTED, ANG_ORDER,
+    t = polyline_cost(pts, nx, z, crr, drag_coef(drag), tcost, blocked, ANG_SORTED, ANG_ORDER,
                       res, m, eta_d, eta_r, tan_max)
     r, c = np.divmod(pts, nx)
     km = float(np.sum(np.hypot(np.diff(r), np.diff(c)))) * res / 1000.0
@@ -886,7 +1146,7 @@ def _cbar(fig, im, ax, label):
     return cb
 
 
-def plot_routes(z_filled, blocked, info, routes, title, out):
+def plot_routes(z_filled, blocked, info, routes, title, out, zones=()):
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
     ext = [info["left"] / 1000, info["right"] / 1000,
@@ -913,13 +1173,67 @@ def plot_routes(z_filled, blocked, info, routes, title, out):
                                label="start", zorder=20)[0])
         handles.append(ax.plot(xs[-1], ys[-1], "s", ms=10, mec=INK, mfc=INK,
                                label="goal", zorder=20)[0])
-    handles.append(Patch(color=CRITICAL, label="off-limits (too steep, e.g. station)"))
+    from matplotlib.patches import Circle
+    for (x, y, rad, name) in zones:
+        ax.add_patch(Circle((x / 1000, y / 1000), rad / 1000, fill=False, ec=CRITICAL,
+                            lw=1.5, ls="--"))
+    handles.append(Patch(color=CRITICAL, label="off-limits (too steep or keep-out zone)"))
     handles.append(plt.Line2D([], [], color=SERIES[0], lw=1, ls=":", alpha=0.6,
                               label="full: raw grid route before smoothing"))
     ax.legend(handles=handles, loc="upper right", fontsize=8, frameon=True,
               facecolor="#fcfcfb", edgecolor=GRIDC)
     _style(ax, title, "Grey = terrain shading only (light/dark = slope facing the "
            "light). Energy = each route scored with the FULL model.")
+    ax.set_xlabel("x (km, EPSG:3031)", color=INK2)
+    ax.set_ylabel("y (km, EPSG:3031)", color=INK2)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    print(f"Saved picture: {out}")
+
+
+def plot_closeup(z_filled, steep, keep, zones, info, routes, center_rc, gap_m, out,
+                 half_m=1500.0):
+    """Zoomed view where the route passes closest to anything off-limits."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch, Circle
+    res = info["res"]
+    ny, nx = z_filled.shape
+    k = int(half_m / res)
+    r0 = int(max(0, center_rc[0] - k)); r1 = int(min(ny, center_rc[0] + k))
+    c0 = int(max(0, center_rc[1] - k)); c1 = int(min(nx, center_rc[1] + k))
+    ext = [(info["left"] + c0 * res) / 1000, (info["left"] + c1 * res) / 1000,
+           (info["top"] - r1 * res) / 1000, (info["top"] - r0 * res) / 1000]
+    fig, ax = plt.subplots(figsize=(10, 10), facecolor="#fcfcfb")
+    ax.imshow(_hillshade(z_filled, res)[r0:r1, c0:c1], cmap="gray", vmin=-0.3, vmax=1.2,
+              extent=ext)
+    km = np.ma.masked_where(~keep[r0:r1, c0:c1], np.ones((r1 - r0, c1 - c0)))
+    ax.imshow(km, cmap=ListedColormap([CRITICAL]), alpha=0.25, extent=ext,
+              interpolation="nearest")
+    sm = np.ma.masked_where(~steep[r0:r1, c0:c1], np.ones((r1 - r0, c1 - c0)))
+    ax.imshow(sm, cmap=ListedColormap([CRITICAL]), extent=ext, interpolation="nearest")
+    for (x, y, rad, name) in zones:
+        ax.add_patch(Circle((x / 1000, y / 1000), rad / 1000, fill=False, ec=CRITICAL,
+                            lw=1.5, ls="--"))
+    handles = []
+    for i, (name, pts, grid, wh) in enumerate(routes):
+        col = SERIES[i % len(SERIES)]
+        if i == 0 and grid is not None:
+            gx, gy = _pts_xy(grid, nx, info)
+            ax.plot(gx, gy, lw=1, color=col, ls=":", alpha=0.7)
+        xs, ys = _pts_xy(pts, nx, info)
+        handles.append(ax.plot(xs, ys, lw=2.6 if i == 0 else 1.6, color=col,
+                               zorder=10 - i, label=name)[0])
+    handles += [Patch(color=CRITICAL, label="off-limits: too steep (buildings, piles)"),
+                Patch(color=CRITICAL, alpha=0.25, label="off-limits: keep-out zone"),
+                plt.Line2D([], [], color=SERIES[0], ls=":", label="full: raw grid route")]
+    ax.set_xlim(ext[0], ext[1])
+    ax.set_ylim(ext[2], ext[3])
+    ax.legend(handles=handles, loc="upper right", fontsize=8, facecolor="#fcfcfb",
+              edgecolor=GRIDC)
+    _style(ax, f"Close-up around the station (full route's closest approach to "
+           f"off-limits ground: {gap_m:.0f} m)", f"{2 * half_m / 1000:.0f} x {2 * half_m / 1000:.0f} km "
+           "window. Solid red = too steep. Faint red inside dashed circle = keep-out zone.")
     ax.set_xlabel("x (km, EPSG:3031)", color=INK2)
     ax.set_ylabel("y (km, EPSG:3031)", color=INK2)
     fig.tight_layout()
@@ -1116,6 +1430,8 @@ def main():
                     help="features in the full model, e.g. 'weather,snow,rough'")
     ap.add_argument("--no-ablate", action="store_true", help="only run the full model")
     ap.add_argument("--no-smooth", action="store_true", help="report raw grid routes")
+    ap.add_argument("--no-relax", action="store_true",
+                    help="skip the waypoint-nudging step after smoothing")
     ap.add_argument("--start", nargs=2, type=float, default=DEFAULT_START, metavar=("X", "Y"))
     ap.add_argument("--goal", nargs=2, type=float, default=DEFAULT_GOAL, metavar=("X", "Y"))
     ap.add_argument("--months", default="11,12,1",
@@ -1124,6 +1440,10 @@ def main():
                     help="also run Dijkstra on the full model and check it matches A*")
     ap.add_argument("--recompute-rough", action="store_true",
                     help="recompute roughness instead of using the cached file")
+    ap.add_argument("--keepout", nargs=3, type=float, action="append", metavar=("X", "Y", "R"),
+                    help="extra no-go circle (EPSG:3031 x, y, radius m); repeatable")
+    ap.add_argument("--no-keepout", action="store_true",
+                    help="ignore the keep-out zones in PARAMS (only steep cells are off-limits)")
     ap.add_argument("--no-show", action="store_true", help="save pictures without opening them")
     args = ap.parse_args()
 
@@ -1131,6 +1451,8 @@ def main():
     p = dict(PARAMS)
     if args.no_smooth:
         p["smooth"] = False
+    if args.no_relax:
+        p["relax"] = False
     dem_path = Path(args.dem)
     dem_path = dem_path if dem_path.is_absolute() else HERE / dem_path
     era5_dir = Path(args.era5_dir)
@@ -1145,16 +1467,25 @@ def main():
     z, info = load_dem(dem_path)
     res = info["res"]
     blocked, z_filled, slope = make_blocked(z, res, p)
+    steep_blocked = blocked.copy()
+    zones = [] if args.no_keepout else list(p["keepouts"])
+    for x, y, rad in (args.keepout or []):
+        zones.append((x, y, rad, "extra keep-out"))
+    keep, zones_used = keepout_mask(info, z.shape, zones)
+    blocked = blocked | keep
     ny, nx = z.shape
     sr, sc = xy_to_index(*args.start, info, z.shape)
     gr, gc = xy_to_index(*args.goal, info, z.shape)
     for lab, (r, c) in (("start", (sr, sc)), ("goal", (gr, gc))):
         if blocked[r, c]:
-            sys.exit(f"The {lab} point is in an off-limits (too steep) cell. Move it.")
+            sys.exit(f"The {lab} point is in an off-limits cell (too steep or keep-out). Move it.")
     s, g = sr * nx + sc, gr * nx + gc
     straight_km = res * math.hypot(gr - sr, gc - sc) / 1000
     print(f"\nGrid {nx} x {ny} at {res:.0f} m, {blocked.mean() * 100:.3f}% off-limits, "
           f"16 directions{', smoothing on' if p['smooth'] else ''}")
+    print(f"  steep cells: {steep_blocked.sum():,}   keep-out cells: {keep.sum():,}"
+          + "".join(f"\n  keep-out: {n} ({x:.0f}, {y:.0f}), radius {r:.0f} m"
+                    for x, y, r, n in zones_used))
     print(f"Start ({args.start[0]:.0f}, {args.start[1]:.0f})  ->  "
           f"Goal ({args.goal[0]:.0f}, {args.goal[1]:.0f})   straight line {straight_km:.2f} km\n")
 
@@ -1253,6 +1584,12 @@ def main():
     print()
     b_full = score(results["full"][1], z_filled, res, *full_layers, blocked, nx, p)
     print_breakdown("full route (smoothed), scored with the full model", b_full)
+    ca = closest_approach(results["full"][1], blocked, nx, res)
+    if ca is not None:
+        cx = info["left"] + (ca[2] + 0.5) * res
+        cy = info["top"] - (ca[1] + 0.5) * res
+        print(f"    closest approach to an off-limits cell: {ca[0]:.0f} m, at ({cx:.0f}, {cy:.0f})"
+              "  -> see outputs/closeup.png")
 
     routes = [("full", results["full"][1], results["full"][0], b_full["total"])]
     if len(results) > 1:
@@ -1270,10 +1607,18 @@ def main():
 
     plot_routes(z_filled, blocked, info, routes,
                 f"Routes - full model = {sorted(available) if available else 'baseline'}",
-                OUT_DIR / "routes.png")
+                OUT_DIR / "routes.png", zones_used)
     plot_factors(info, z_filled, slope, blocked, snow_cls, rough_r, rough_floor,
                  full_layers[0], full_layers[2], full_layers[1], results["full"][1],
                  b_full, (gr, gc), (sr, sc), p, OUT_DIR / "factors.png")
+    if ca is not None:
+        if zones_used:      # centre on the first keep-out zone (e.g. the station)
+            zx, zy = zones_used[0][0], zones_used[0][1]
+            center = ((info["top"] - zy) / res - 0.5, (zx - info["left"]) / res - 0.5)
+        else:
+            center = (ca[1], ca[2])
+        plot_closeup(z_filled, steep_blocked, keep, zones_used, info, routes,
+                     center, ca[0], OUT_DIR / "closeup.png")
     for name, (path, pts) in results.items():
         for tag, arr in (("", pts), ("_grid", path)):
             r, c = np.divmod(arr, nx)
